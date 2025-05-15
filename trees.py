@@ -1,163 +1,205 @@
 import numpy as np
 import pygame
-import random
-import time
 import matplotlib.pyplot as plt
-from multiprocessing import Process
+from numba import jit, prange
+import os
 
-# Размеры клетки и дополнительная высота для вывода текста (расширено для нескольких строк)
+# Константы
 CELL_SIZE = 50
-TEXT_AREA_HEIGHT = 150  # увеличенная высота для вывода статистики
+TEXT_AREA_HEIGHT = 150
+TREE = 1
+FIRE = 2
+EMPTY = 0
 
 # Инициализация pygame
 pygame.init()
 
-# Загрузка изображений
-TREE_IMAGE = pygame.image.load('tree.png')  # Замените на путь к вашему изображению дерева
-FIRE_IMAGE = pygame.image.load('fire.png')  # Замените на путь к вашему изображению огня
+# Загрузка изображений с фоллбэком
+try:
+    TREE_IMAGE = pygame.transform.scale(pygame.image.load('tree.png'), (CELL_SIZE, CELL_SIZE))
+except FileNotFoundError:
+    TREE_IMAGE = pygame.Surface((CELL_SIZE, CELL_SIZE))
+    TREE_IMAGE.fill((34, 139, 34))  # Зеленый цвет
 
-# Масштабируем изображения до нужного размера
-TREE_IMAGE = pygame.transform.scale(TREE_IMAGE, (CELL_SIZE, CELL_SIZE))
-FIRE_IMAGE = pygame.transform.scale(FIRE_IMAGE, (CELL_SIZE, CELL_SIZE))
+try:
+    FIRE_IMAGE = pygame.transform.scale(pygame.image.load('fire.png'), (CELL_SIZE, CELL_SIZE))
+except FileNotFoundError:
+    FIRE_IMAGE = pygame.Surface((CELL_SIZE, CELL_SIZE))
+    FIRE_IMAGE.fill((255, 0, 0))  # Красный цвет
 
-# Цвет для пустых клеток
 EMPTY_COLOR = (255, 255, 255)
 
-# Функция для инициализации поля
+@jit(nopython=True)
 def create_forest(n):
-    return np.full((n, n), None)
+    return np.zeros((n, n), dtype=np.int8)
 
-# Функция для расчёта текущей плотности деревьев
+@jit(nopython=True)
 def density_trees(forest):
-    n = forest.shape[0]
-    total_cells = n * n
-    tree_count = sum(1 for i in range(n) for j in range(n) if forest[i, j] == 'Tree')
-    return tree_count / total_cells
+    return np.mean(forest == TREE)
 
-# Функция для получения соседей клетки (четырёх смежных)
-def get_neighbors(i, j, n):
-    neighbors = []
-    if i > 0:         neighbors.append((i - 1, j))
-    if i < n - 1:     neighbors.append((i + 1, j))
-    if j > 0:         neighbors.append((i, j - 1))
-    if j < n - 1:     neighbors.append((i, j + 1))
-    return neighbors
-
-# Функция для подсчёта числа кластеров деревьев
-def cluster_count(forest):
-    n = forest.shape[0]
-    visited = np.full((n, n), False)
-    clusters = 0
-    def dfs(i, j):
-        stack = [(i, j)]
-        while stack:
-            ci, cj = stack.pop()
-            if visited[ci, cj]: continue
-            visited[ci, cj] = True
-            for ni, nj in get_neighbors(ci, cj, n):
-                if not visited[ni, nj] and forest[ni, nj] == 'Tree': stack.append((ni, nj))
-    for i in range(n):
-        for j in range(n):
-            if forest[i, j] == 'Tree' and not visited[i, j]:
-                clusters += 1
-                dfs(i, j)
-    return clusters
-
-# Функция для обновления состояния клеток. Возвращает текущую плотность.
+@jit(nopython=True, parallel=True)
 def update_forest(forest, epsilon, theta):
     n = forest.shape[0]
-    fire_spread, to_burn = [], []
-    for i in range(n):
-        for j in range(n):
-            if forest[i, j] is None and random.random() < epsilon: forest[i, j] = 'Tree'
-    for i in range(n):
-        for j in range(n):
-            if forest[i, j] == 'Fire':
-                for ni, nj in get_neighbors(i, j, n):
-                    if forest[ni, nj] == 'Tree': fire_spread.append((ni, nj))
-                to_burn.append((i, j))
-    for ni, nj in fire_spread:
-        if forest[ni, nj] == 'Tree': forest[ni, nj] = 'Fire'
-    for i, j in to_burn:
-        forest[i, j] = None
-    for i in range(n):
-        for j in range(n):
-            if forest[i, j] == 'Tree' and random.random() < theta: forest[i, j] = 'Fire'
-    return density_trees(forest)
+    new_forest = forest.copy()
+    
+    # Генерация новых деревьев
+    for i in prange(n):
+        for j in prange(n):
+            if forest[i, j] == EMPTY and np.random.rand() < epsilon:
+                new_forest[i, j] = TREE
+                
+    # Удары молний
+    for i in prange(n):
+        for j in prange(n):
+            if new_forest[i, j] == TREE and np.random.rand() < theta:
+                new_forest[i, j] = FIRE
+                
+    # Распространение огня
+    fire_spread = np.zeros((n, n), dtype=np.int8)
+    for i in prange(n):
+        for j in prange(n):
+            if new_forest[i, j] == FIRE:
+                for di, dj in [(-1,0), (1,0), (0,-1), (0,1)]:
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < n and 0 <= nj < n:
+                        fire_spread[ni, nj] = 1
+                        
+    for i in prange(n):
+        for j in prange(n):
+            if fire_spread[i, j] and new_forest[i, j] == TREE:
+                new_forest[i, j] = FIRE
+                
+    # Гашение огня
+    for i in prange(n):
+        for j in prange(n):
+            if forest[i, j] == FIRE:
+                new_forest[i, j] = EMPTY
+                
+    return new_forest
 
-# Функция для рисования поля
+class UnionFind:
+    def __init__(self, size):
+        self.parent = list(range(size))
+    
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+    
+    def union(self, x, y):
+        fx = self.find(x)
+        fy = self.find(y)
+        if fx != fy:
+            self.parent[fy] = fx
+
+def cluster_count(forest):
+    n = forest.shape[0]
+    uf = UnionFind(n * n)
+    
+    for i in range(n):
+        for j in range(n):
+            if forest[i, j] != TREE:
+                continue
+            idx = i * n + j
+            if i > 0 and forest[i-1, j] == TREE:
+                uf.union(idx, (i-1)*n + j)
+            if j > 0 and forest[i, j-1] == TREE:
+                uf.union(idx, i*n + (j-1))
+    
+    roots = set()
+    for i in range(n):
+        for j in range(n):
+            if forest[i, j] == TREE:
+                roots.add(uf.find(i*n + j))
+    
+    return len(roots)
+
 def draw_forest(screen, forest, n):
     for i in range(n):
         for j in range(n):
-            if forest[i, j] == 'Tree': screen.blit(TREE_IMAGE, (j * CELL_SIZE, i * CELL_SIZE))
-            elif forest[i, j] == 'Fire': screen.blit(FIRE_IMAGE, (j * CELL_SIZE, i * CELL_SIZE))
-    pygame.draw.line(screen, (0, 0, 0), (0, n * CELL_SIZE), (n * CELL_SIZE, n * CELL_SIZE), 2)
+            pos = (j*CELL_SIZE, i*CELL_SIZE)
+            if forest[i, j] == TREE:
+                screen.blit(TREE_IMAGE, pos)
+            elif forest[i, j] == FIRE:
+                screen.blit(FIRE_IMAGE, pos)
+    pygame.draw.line(screen, (0,0,0), (0, n*CELL_SIZE), (n*CELL_SIZE, n*CELL_SIZE), 2)
 
-# Основная функция симуляции
 def main():
-    # Параметры симуляции
     n = int(input("Введите размер поля n: "))
     epsilon = float(input("Введите вероятность появления дерева ε (0-1): "))
     theta = float(input("Введите вероятность удара молнии θ (0-1): "))
-    # Настройка окна
-    width, height = n * CELL_SIZE, n * CELL_SIZE + TEXT_AREA_HEIGHT
+    
+    width, height = n*CELL_SIZE, n*CELL_SIZE + TEXT_AREA_HEIGHT
     screen = pygame.display.set_mode((width, height))
     pygame.display.set_caption("Модель лесных пожаров")
     font = pygame.font.SysFont("arial", 24)
+    
     forest = create_forest(n)
     stats_steps = 300
     density_history, clusters_history = [], []
-    total_d = total_c = 0
-
+    total_d, total_c = 0.0, 0.0
+    
     clock = pygame.time.Clock()
-    step = 0
-    while step < stats_steps:
-        d = update_forest(forest, epsilon, theta)
+    
+    for step in range(1, stats_steps+1):
+        forest = update_forest(forest, epsilon, theta)
+        d = density_trees(forest)
         c = cluster_count(forest)
-        step += 1
+        
         total_d += d
         total_c += c
-        density_history.append(total_d/step)
-        clusters_history.append(total_c/step)
-
+        
+        avg_d = total_d / step
+        avg_c = total_c / step
+        
+        density_history.append(avg_d)
+        clusters_history.append(avg_c)
+        
+        # Отрисовка
         screen.fill(EMPTY_COLOR)
         draw_forest(screen, forest, n)
-        stats = [f"Шаг {step}/{stats_steps}  Текущая плотность деревьев:  {d:.2f}",
-               f"Средняя плотность деревьев:  {total_d/step:.2f}",
-               f"Текущее количество кластеров:  {c}",
-               f"Среднее количество кластеров:  {total_c/step:.2f}"
+        
+        stats = [
+            f"Шаг {step}/{stats_steps}",
+            f"Текущая плотность: {d:.2f}",
+            f"Средняя плотность: {avg_d:.2f}",
+            f"Текущие кластеры: {c}",
+            f"Среднее кластеров: {avg_c:.2f}"
         ]
+        
         for idx, line in enumerate(stats):
-            screen.blit(font.render(line, True, (0,0,0)),
-                        (10, n*CELL_SIZE + 10 + idx*30))
+            screen.blit(font.render(line, True, (0,0,0)), 
+                        (10, n*CELL_SIZE + 10 + idx*25))
+        
         pygame.display.flip()
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                step = stats_steps
-                break
-        time.sleep(0.05)
-        clock.tick(10)
+        
+        if pygame.event.get(pygame.QUIT):
+            break
+        
+        clock.tick(20)
+    
     pygame.quit()
-    return density_history, clusters_history, n, epsilon, theta
+    
+    # Построение графиков средних значений
+    plt.figure(figsize=(12, 6))
+    
+    plt.subplot(121)
+    plt.plot(density_history, label='Средняя плотность')
+    plt.title("Динамика средней плотности деревьев")
+    plt.xlabel("Шаги")
+    plt.ylabel("Плотность")
+    plt.grid(True)
+    
+    plt.subplot(122)
+    plt.plot(clusters_history, color='orange', label='Среднее кластеров')
+    plt.title("Динамика количества кластеров")
+    plt.xlabel("Шаги")
+    plt.ylabel("Кластеры")
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    density_history, clusters_history, n, epsilon, theta = main()
-    # График средней плотности
-    plt.figure(figsize=(10, 5))
-    plt.plot(density_history, marker='o', linewidth=1)
-    plt.title(f"Средняя плотность деревьев по шагам (n={n}, ε={epsilon:.2f}, θ={theta:.2f})")
-    plt.xlabel('Шаг')
-    plt.ylabel('Средняя плотность')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-    # График среднего числа кластеров
-    plt.figure(figsize=(10, 5))
-    plt.plot(clusters_history, marker='s', linewidth=1)
-    plt.title(f"Среднее число кластеров по шагам (n={n}, ε={epsilon:.2f}, θ={theta:.2f})")
-    plt.xlabel('Шаг')
-    plt.ylabel('Среднее число кластеров')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    main()
